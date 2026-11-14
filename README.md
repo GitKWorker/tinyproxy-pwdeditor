@@ -56,40 +56,108 @@ grep 'dport=22' /proc/net/nf_conntrack
 - 大写、小写、数字各至少一位
 - 排除 `0 O 1 l I`，避免从手机屏幕上抄错
 
+## 密钥分工（先看这节）
+
+SSH 公钥认证的方向是固定的：**私钥留在发起连接的一方，公钥交给被连接的一方。**
+这里发起连接的是青龙，被连接的是路由器。
+
+| 文件 | 在哪生成 | 放哪 | 权限 | 进仓库 |
+|---|---|---|---|---|
+| `tp-ROUTER`（**私钥**，无扩展名） | 青龙容器 | `/ql/data/keys/tp-ROUTER` | `600` | **绝对不行** |
+| `tp-ROUTER.pub`（**公钥**） | 青龙容器 | 路由器 `/etc/dropbear/authorized_keys` 里的**一行** | 该文件 `600` | 不敏感，但没必要 |
+| `known_hosts.tp-ROUTER` | 青龙容器 | `/ql/data/keys/` | `644` | 不要，绑死了具体主机 |
+
+一句话：**青龙拿私钥，路由器只拿公钥。** 反过来是错的 —— 把私钥放到路由器
+上，等于把"我是青龙"这个身份交出去，任何拿到它的进程都能冒充青龙。
+
+私钥泄露的后果被 `command=` 限制压到了"能改一个账号的密码"，但压不到零，
+所以私钥按密码对待：`600`、不进仓库、不进聊天记录、不贴群里。
+
 ## 部署
 
-### 1. 路由器端
+### 1. 青龙端：生成密钥对（只做一次）
 
-把 `openwrt/tp-setpw` 放到 `/usr/sbin/`，加执行位：
+在青龙容器的终端里执行（面板右上角「终端」，或者 `docker exec -it qinglong sh`）：
+
+```sh
+mkdir -p /ql/data/keys
+chmod 700 /ql/data/keys
+ssh-keygen -t ed25519 -N "" -C "ql-tp-rotate" -f /ql/data/keys/tp-ROUTER
+chmod 600 /ql/data/keys/tp-ROUTER
+ssh-keyscan -t ed25519,rsa ROUTER > /ql/data/keys/known_hosts.tp-ROUTER
+cat /ql/data/keys/tp-ROUTER.pub
+```
+
+- `-N ""` 是空口令：任务无人值守，必须免密。代价是私钥文件本身就是凭据，
+  所以 `600` 不能省。
+- 最后一行输出的**整行**就是要贴到路由器上的公钥，从 `ssh-ed25519` 开始到
+  `ql-tp-rotate` 结束，复制它。
+
+### 2. 路由器端：装 helper、写公钥
+
+先把 `openwrt/tp-setpw` 放进去：
 
 ```sh
 scp openwrt/tp-setpw root@ROUTER:/usr/sbin/tp-setpw
 ssh root@ROUTER 'chmod 755 /usr/sbin/tp-setpw'
 ```
 
-在路由器上生成一把专用密钥（或者把已有的公钥拿来用），然后把公钥写进
-`/etc/dropbear/authorized_keys`，**必须带 `command=` 前缀**：
-
-```
-command="/usr/sbin/tp-setpw",no-pty,no-port-forwarding,no-agent-forwarding,no-x11-forwarding ssh-ed25519 AAAA... comment
-```
-
-改之前先备份：
+备份 `authorized_keys`，**这一步不能省**，写坏了就再也进不去：
 
 ```sh
 cp -a /etc/dropbear/authorized_keys /etc/dropbear/authorized_keys.bak-$(date +%Y%m%d)
 ```
 
-验证锁定生效（应该返回 `ERR empty-password`，而不是文件内容）：
+然后手工追加公钥。**不要用 `ssh-copy-id`** —— 它只会写一条裸公钥，不会带
+`command=` 前缀，那样这把 key 就等同于一个完整的 root shell。
+
+把下面这一行整行单引号包住，`ssh-ed25519` 后面对着换成上一步复制的内容：
 
 ```sh
-ssh -i KEY root@ROUTER 'cat /etc/shadow' </dev/null
+echo 'command="/usr/sbin/tp-setpw",no-pty,no-port-forwarding,no-agent-forwarding,no-x11-forwarding ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA...replace-with-yours ql-tp-rotate' >> /etc/dropbear/authorized_keys
 ```
+
+几个必须注意的点：
+
+- 整行要用**单引号**包住，因为里面有双引号，用双引号包会被 shell 解释
+- `command=` 和公钥在**同一行**，逗号分隔各个选项，选项和 `ssh-ed25519`
+  之间是空格
+- 行尾不能有多余空格或换行错位
+- 文件权限必须是 `600`、属主 `root`，否则 dropbear 直接忽略这个文件
+
+```sh
+chmod 600 /etc/dropbear/authorized_keys
+chown root:root /etc/dropbear/authorized_keys
+```
+
+dropbear **不需要重启**，每次认证都会重读这个文件。
+
+验证追加成功（行数应该比原来多 1）：
+
+```sh
+wc -l /etc/dropbear/authorized_keys
+tail -n 1 /etc/dropbear/authorized_keys | cut -c1-70
+```
+
+再回到青龙容器验证锁定真的生效 —— 期望返回 `ERR empty-password`，
+而不是 `/etc/shadow` 的内容：
+
+```sh
+ssh -T -i /ql/data/keys/tp-ROUTER \
+    -o UserKnownHostsFile=/ql/data/keys/known_hosts.tp-ROUTER \
+    -o StrictHostKeyChecking=yes -o BatchMode=yes -o IdentitiesOnly=yes \
+    root@ROUTER 'cat /etc/shadow' </dev/null
+```
+
+如果报 `Permission denied (publickey)`，多半是某个 option 拼错导致 dropbear
+整行丢弃。排查办法：临时把 `command=` 和所有 `no-*` 全去掉，只留裸公钥
+`ssh-ed25519 AAAA...` 试一次，能连说明是 option 的问题，逐个加回来定位。
 
 前提：路由器上 tinyproxy 的 `BasicAuth` 至少有一条 `root ...` 和一条
 `user ...`，且 `root` 在第一条 —— 状态页依赖这个顺序。
 
-### 2. 青龙端：代码从仓库拉，不手工拷
+
+### 3. 青龙端：代码从仓库拉，不手工拷
 
 青龙面板 → 订阅管理 → 新建订阅：
 
@@ -108,21 +176,10 @@ ssh -i KEY root@ROUTER 'cat /etc/shadow' </dev/null
 **不要手工把脚本拷进容器。** 手工副本和仓库会分叉，下次拉取是覆盖
 还是并存取决于青龙版本，迟早会跑到一份过期代码上。
 
-### 2.1 两样东西必须手工放（含环境信息，不进仓库）
+### 4. 青龙端：写配置
 
-**密钥**，在青龙容器里生成：
-
-```sh
-mkdir -p /ql/data/keys
-ssh-keygen -t ed25519 -N "" -C "ql-tp-rotate" -f /ql/data/keys/tp-ROUTER
-chmod 600 /ql/data/keys/tp-ROUTER
-ssh-keyscan -t ed25519,rsa ROUTER > /ql/data/keys/known_hosts.tp-ROUTER
-```
-
-把 `tp-ROUTER.pub` 贴到路由器的 `authorized_keys`（见上一步）。
-
-**配置**，复制 `config.example.json` 到 `/ql/data/config/tp-rotate.json`
-并按实际环境填写：
+密钥在第 1 步已经生成好了，这一步只放配置。复制 `config.example.json`
+到 `/ql/data/config/tp-rotate.json` 并按实际环境填写：
 
 ```json
 {
@@ -152,7 +209,7 @@ ssh-keyscan -t ed25519,rsa ROUTER > /ql/data/keys/known_hosts.tp-ROUTER
 `tp-rotate.json` 里有内网地址，**不要提交到任何仓库**，权限设 `600`。
 配置路径可以用环境变量 `TP_CONFIG` 覆盖，方便一份代码挂多个环境。
 
-### 3. 环境变量
+### 5. 环境变量
 
 在青龙「环境变量」里加：
 
@@ -162,7 +219,7 @@ ssh-keyscan -t ed25519,rsa ROUTER > /ql/data/keys/known_hosts.tp-ROUTER
 
 没设这个变量时脚本照常轮换，只是不推送。
 
-### 4. 建任务
+### 6. 建任务
 
 青龙面板 → 定时任务 → 新建：
 
