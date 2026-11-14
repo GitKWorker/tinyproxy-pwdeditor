@@ -203,6 +203,7 @@ wecom=693a91f6-xxxx-xxxx-xxxx-xxxxxxxxxxxx|label=router-a,host=10.0.0.1,port=22,
 | `key` | **是** | — | 私钥路径。私钥**只能**是文件，不能内联 |
 | `label` | 否 | 取 `host` | 显示名。不给 `hostkey`/`known_hosts` 时也用它拼文件名 |
 | `port` | 否 | `22` | SSH 端口 |
+| `proxy_port` | 否 | `38888` | tinyproxy 监听端口，只影响群消息里的 `地址` 那一行 |
 | `user` | 否 | `root` | SSH 登录用户 |
 | `account` | 否 | `user` | 要改密码的 tinyproxy 账号，**只能是 `user`**，helper 硬拒绝 `root` |
 | `hostkey` | 二选一 | — | 内联主机公钥，格式 `ssh-ed25519:AAAAC3...` |
@@ -346,10 +347,34 @@ DRY_RUN, nothing pushed
 
 ```
 【tinyproxy 密码轮换】
-router-a  user / Kx7mPq3T
+时间：2026-11-14 19:45
+
+设备：router-a
+地址：10.0.0.1:38888
+账号：user
+密码：Kx7mPq3T
 ```
 
-失败时对应目标是 `失败：<原因>（原密码保持不变）`，脚本退出码非 0。
+一台路由器一块，块与块之间空一行。**设备名、地址（IP + tinyproxy 端口）、
+账号、新密码四样齐全** —— 群消息是给人照着填客户端用的，不该再让人回头翻
+配置文件对 IP。端口取 `proxy_port`，默认 `38888`。
+
+失败的目标也占一块，`密码` 那行变成 `密码：未变更（<原因>）`，脚本退出码非 0。
+这样群里能一眼看出哪台没换成，而不是整条消息只有一句笼统的报错。
+
+`--dry-run` 不发消息，但会打印 `--- message preview ---` 让你先看排版：
+
+```
+--- message preview ---
+【tinyproxy 密码轮换】（DRY_RUN 预演，未改动）
+时间：2026-11-14 19:45
+
+设备：router-a
+地址：10.0.0.1:38888
+账号：user
+密码：Ab3dEf6h（预演，未下发）
+--- end preview ---
+```
 
 ## 路由器本地自检
 
@@ -381,6 +406,27 @@ rm -f /usr/sbin/tp-setpw
 ```sh
 uci get tinyproxy.@tinyproxy[0].BasicAuth
 ```
+
+## 配套的客户端包
+
+密码轮换的目的是让客户端始终连得上，真正拿去用的客户端在 Releases 里，
+不塞进仓库正文（两个包加起来快 40 MB，进 git 历史没有意义）：
+
+| 平台 | 文件 | 内容 |
+|---|---|---|
+| Windows | `cloudflare-tunnel-proxy-surfing-windows.zip` | `开代理.bat` / `关代理.bat` / `检测.bat` + `cloudflared.exe` |
+| Linux | `cloudflare-tunnel-proxy-surfing-linux.tar.gz` | `start.sh` / `stop.sh` / `check.sh` + `cloudflared` |
+
+```
+https://github.com/GitKWorker/tinyproxy-pwdeditor/releases/latest
+```
+
+用法：解压 → 首次运行填 Cloudflare 隧道域名（写进 `config.txt` 的 `HOSTNAME`）
+→ 系统代理指向 `127.0.0.1:18888` → 浏览器弹认证框时填群消息里的 `账号` 和 `密码`。
+
+**包里不含任何凭据**，所以可以公开分发：`config.txt` 只有 `HOSTNAME` 和
+`LOCAL_PORT` 两项，账号密码由人在浏览器认证框里当场输入，不写盘、不进配置。
+密码每次轮换后，重新看一眼群消息即可。
 
 ## 约定
 

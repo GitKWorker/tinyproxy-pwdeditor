@@ -28,6 +28,7 @@ import secrets
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.request
 
 # 0 O 1 l I are left out so a password read off a phone screen cannot be
@@ -36,12 +37,17 @@ ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789"
 DEFAULT_CONFIG = "/ql/data/config/tp-rotate.json"
 ENV_NAME = "TINYPROXY_PWDEDITOR"
 PASSWORD_LENGTH = 8
+# tinyproxy's listening port, shown in the WeCom message next to the host so
+# whoever reads it can go straight to the right port. Overridable per target
+# with proxy_port= when a router runs tinyproxy somewhere else.
+PROXY_PORT_DEFAULT = 38888
 
 # Fields that describe one router.
 TARGET_FIELDS = (
     "label",
     "host",
     "port",
+    "proxy_port",
     "user",
     "account",
     "key",
@@ -253,6 +259,33 @@ def ssh_rotate(target, password):
     return False, out or err or "exit-%d" % proc.returncode
 
 
+def report_block(target, account, password=None, error=None, dry=False):
+    """Build one device's section of the WeCom message.
+
+    Everything needed to actually use the proxy goes in one block: which
+    device it is, where to point the client, which account, and the new
+    password. Reading it off a phone should not require cross-referencing
+    the config file.
+    """
+    label = target.get("label") or target["host"]
+    proxy_port = target.get("proxy_port") or PROXY_PORT_DEFAULT
+    out = [
+        "设备：%s" % label,
+        "地址：%s:%s" % (target["host"], proxy_port),
+        "账号：%s" % account,
+    ]
+    if error:
+        detail = " ".join(str(error).split())
+        if len(detail) > 160:
+            detail = detail[:157] + "..."
+        out.append("密码：未变更（%s）" % detail)
+    elif dry:
+        out.append("密码：%s（预演，未下发）" % password)
+    else:
+        out.append("密码：%s" % password)
+    return "\n".join(out)
+
+
 def wecom_send(key, content):
     url = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=" + key
     body = json.dumps(
@@ -279,7 +312,11 @@ def main():
         log("no target configured")
         return 2
 
-    lines = ["【tinyproxy 密码轮换】" + ("（DRY_RUN）" if dry else "")]
+    head = "【tinyproxy 密码轮换】"
+    if dry:
+        head += "（DRY_RUN 预演，未改动）"
+    head += "\n时间：%s" % time.strftime("%Y-%m-%d %H:%M")
+    blocks = [head]
     failures = 0
 
     for target in targets:
@@ -295,6 +332,7 @@ def main():
             except ValueError as exc:
                 log("[CONFIG] %s  %s" % (label, exc))
                 failures += 1
+                blocks.append(report_block(target, account, error="config: %s" % exc))
                 continue
             log(
                 "[DRY_RUN] %s -> %s@%s:%s account=%s key=%s kh=%s"
@@ -308,20 +346,20 @@ def main():
                     kh_note,
                 )
             )
-            lines.append("* %s  %s / %s  (not pushed)" % (label, account, gen_password()))
+            blocks.append(report_block(target, account, password=gen_password(), dry=True))
             continue
 
         password = gen_password()
         ok, detail = ssh_rotate(target, password)
         if ok:
             log("[OK] %s  %s / %s" % (label, account, password))
-            lines.append("%s  %s / %s" % (label, account, password))
+            blocks.append(report_block(target, account, password=password))
         else:
             failures += 1
             log("[FAIL] %s  %s" % (label, detail))
-            lines.append("%s  failed: %s (previous password kept)" % (label, detail))
+            blocks.append(report_block(target, account, error=detail))
 
-    content = "\n".join(lines)
+    content = "\n\n".join(blocks)
 
     key, source = resolve_wecom_key(opts)
     if dry:
@@ -329,6 +367,11 @@ def main():
             log("[DRY_RUN] wecom key set (%d chars, from %s)" % (len(key), source))
         else:
             log("[DRY_RUN] wecom key not set, push would be skipped")
+        # Show exactly what the group would receive, so the layout can be
+        # checked without rotating a live password.
+        log("--- message preview ---")
+        log(content)
+        log("--- end preview ---")
         log("DRY_RUN, nothing pushed")
         return 1 if failures else 0
 
