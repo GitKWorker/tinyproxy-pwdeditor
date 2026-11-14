@@ -31,6 +31,24 @@
   一个指定账号的密码，拿不到 shell、做不了端口转发
 - 青龙官方的 Alpine 镜像自带 `ssh` / `curl` / `python3`，零安装
 
+## 青龙到路由器走的什么路径
+
+```
+青龙容器 172.17.0.5/16
+  └── 默认网关 172.17.0.1 (docker0)
+        └── iptables MASQUERADE  源地址改写为宿主机 LAN 地址
+              └── 宿主机 eth  →  路由器:22
+```
+
+关键是 **MASQUERADE**：路由器上看到的连接来源是宿主机的 LAN 地址，不是
+`172.17.0.x`。所以想靠"只放行容器网段"来收紧权限是做不到的，只能按宿主机
+地址放行。验证方法：
+
+```sh
+# 路由器上
+grep 'dport=22' /proc/net/nf_conntrack
+```
+
 ## 密码规则
 
 - 8 位
@@ -71,7 +89,28 @@ ssh -i KEY root@ROUTER 'cat /etc/shadow' </dev/null
 前提：路由器上 tinyproxy 的 `BasicAuth` 至少有一条 `root ...` 和一条
 `user ...`，且 `root` 在第一条 —— 状态页依赖这个顺序。
 
-### 2. 青龙端
+### 2. 青龙端：代码从仓库拉，不手工拷
+
+青龙面板 → 订阅管理 → 新建订阅：
+
+| 字段 | 值 |
+|---|---|
+| 名称 | `tp-rotate` |
+| 链接 | `https://github.com/USER/tp-rotate.git` |
+| 分支 | `main` |
+| 白名单 | 留空 |
+| 黑名单 | 留空 |
+| 依赖文件 | 留空 |
+| 定时规则 | 留空（只手动拉取，不自动同步） |
+
+保存后点「运行」，代码落到 `/ql/data/scripts/<owner>_tp-rotate/`。
+
+**不要手工把脚本拷进容器。** 手工副本和仓库会分叉，下次拉取是覆盖
+还是并存取决于青龙版本，迟早会跑到一份过期代码上。
+
+### 2.1 两样东西必须手工放（含环境信息，不进仓库）
+
+**密钥**，在青龙容器里生成：
 
 ```sh
 mkdir -p /ql/data/keys
@@ -82,8 +121,8 @@ ssh-keyscan -t ed25519,rsa ROUTER > /ql/data/keys/known_hosts.tp-ROUTER
 
 把 `tp-ROUTER.pub` 贴到路由器的 `authorized_keys`（见上一步）。
 
-复制 `tp_rotate.py` 到 `/ql/data/scripts/`，复制 `config.example.json` 到
-`/ql/data/config/tp-rotate.json` 并按实际环境填写：
+**配置**，复制 `config.example.json` 到 `/ql/data/config/tp-rotate.json`
+并按实际环境填写：
 
 ```json
 {
@@ -111,6 +150,7 @@ ssh-keyscan -t ed25519,rsa ROUTER > /ql/data/keys/known_hosts.tp-ROUTER
 | `known_hosts` | 可选，缺省为私钥同目录下 `known_hosts.<label>` |
 
 `tp-rotate.json` 里有内网地址，**不要提交到任何仓库**，权限设 `600`。
+配置路径可以用环境变量 `TP_CONFIG` 覆盖，方便一份代码挂多个环境。
 
 ### 3. 环境变量
 
@@ -129,11 +169,14 @@ ssh-keyscan -t ed25519,rsa ROUTER > /ql/data/keys/known_hosts.tp-ROUTER
 | 项 | 值 |
 |---|---|
 | 名称 | tinyproxy 密码轮换 |
-| 命令 | `python3 /ql/data/scripts/tp_rotate.py` |
+| 命令 | `python3 /ql/data/scripts/<owner>_tp-rotate/tp_rotate.py` |
 | 定时规则 | 留空（只手动触发，不要填 cron） |
 
-保存后点「运行」即可。要空跑看效果，命令改成
-`python3 /ql/data/scripts/tp_rotate.py --dry-run`。
+`<owner>` 是拉取后实际生成的目录前缀，`ls /ql/data/scripts/ | grep tp-rotate`
+确认一下再填。
+
+保存后点「运行」即可。要空跑看效果，命令后面加 `--dry-run`。
+
 
 ## 输出
 
