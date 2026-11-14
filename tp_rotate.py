@@ -9,10 +9,13 @@ confirmed the new password actually works.
 Configuration comes from the TINYPROXY_PWDEDITOR environment variable, one
 variable holding every parameter:
 
-    TINYPROXY_PWDEDITOR=label=router-a,host=10.0.0.1,port=22,user=root,account=user,key=/ql/data/keys/tp-router-a,hostkey=ssh-ed25519:AAAA...
+    TINYPROXY_PWDEDITOR=wecom=693a91f6-...|label=router-a,host=10.0.0.1,port=22,user=root,account=user,key=/ql/data/keys/tp-router-a,hostkey=ssh-ed25519:AAAA...
 
-Several routers are separated by "|". A JSON file is still accepted as a
-fallback ($TP_CONFIG or /ql/data/config/tp-rotate.json) for older installs.
+Several routers are separated by "|". A chunk that holds only global fields
+(see GLOBAL_FIELDS) is not a target, so the WeCom webhook key can be written as
+its own chunk - or dropped into any target chunk, where it is lifted out and
+applied to the whole run. A JSON file is still accepted as a fallback
+($TP_CONFIG or /ql/data/config/tp-rotate.json) for older installs.
 
 Usage:
     python3 tp_rotate.py            # rotate, then push to WeCom
@@ -34,7 +37,20 @@ DEFAULT_CONFIG = "/ql/data/config/tp-rotate.json"
 ENV_NAME = "TINYPROXY_PWDEDITOR"
 PASSWORD_LENGTH = 8
 
-FIELDS = ("label", "host", "port", "user", "account", "key", "known_hosts", "hostkey")
+# Fields that describe one router.
+TARGET_FIELDS = (
+    "label",
+    "host",
+    "port",
+    "user",
+    "account",
+    "key",
+    "known_hosts",
+    "hostkey",
+)
+# Fields that describe the run as a whole. They may appear in any chunk.
+GLOBAL_FIELDS = ("wecom",)
+FIELDS = TARGET_FIELDS + GLOBAL_FIELDS
 
 
 def log(msg):
@@ -53,14 +69,25 @@ def gen_password(length=PASSWORD_LENGTH):
             return pw
 
 
+def normalize_wecom(value):
+    """Accept either the bare key or the whole webhook URL pasted from WeCom."""
+    value = (value or "").strip().strip("\"'")
+    if not value:
+        return ""
+    if "key=" in value:
+        value = value.split("key=", 1)[1]
+    return value.split("&", 1)[0].strip()
+
+
 def parse_spec(spec):
-    """Parse 'k=v,k=v|k=v' into a list of dicts.
+    """Parse 'k=v,k=v|k=v' into (targets, globals).
 
     Deliberately restricted to characters that survive a shell assignment: no
     spaces, no quotes, no $ or backticks. That is why the host key is written
     as 'ssh-ed25519:AAAA...' instead of the usual space separated pair.
     """
     targets = []
+    opts = {}
     for chunk in spec.split("|"):
         chunk = chunk.strip()
         if not chunk:
@@ -81,21 +108,33 @@ def parse_spec(spec):
             item[key] = value.strip()
         if not item:
             continue
+        # Lift global fields out first: a chunk made of nothing else is a
+        # settings chunk, not a target.
+        for gkey in GLOBAL_FIELDS:
+            if gkey in item:
+                opts[gkey] = item.pop(gkey)
+        if not item:
+            continue
         if "host" not in item:
             raise ValueError("missing required field: host")
         if "key" not in item:
             raise ValueError("missing required field: key (private key path)")
         targets.append(item)
-    return targets
+    return targets, opts
 
 
 def load_targets():
+    """Return (targets, opts, error)."""
     spec = os.environ.get(ENV_NAME, "").strip()
     if spec:
         try:
-            return parse_spec(spec), None
+            targets, opts = parse_spec(spec)
         except ValueError as exc:
-            return None, "%s malformed: %s" % (ENV_NAME, exc)
+            return None, {}, "%s malformed: %s" % (ENV_NAME, exc)
+        if opts.get("wecom"):
+            opts["wecom"] = normalize_wecom(opts["wecom"])
+            opts["wecom_source"] = ENV_NAME
+        return targets, opts, None
 
     # Fallback: JSON file, kept for installs that predate the env variable.
     path = os.environ.get("TP_CONFIG", DEFAULT_CONFIG)
@@ -103,9 +142,12 @@ def load_targets():
         with open(path, encoding="utf-8") as fh:
             cfg = json.load(fh)
     except FileNotFoundError:
-        return None, "neither %s nor the config file %s is present" % (ENV_NAME, path)
+        return None, {}, "neither %s nor the config file %s is present" % (
+            ENV_NAME,
+            path,
+        )
     except ValueError as exc:
-        return None, "config file %s is not valid JSON: %s" % (path, exc)
+        return None, {}, "config file %s is not valid JSON: %s" % (path, exc)
 
     targets = []
     for raw in cfg.get("targets") or []:
@@ -113,7 +155,23 @@ def load_targets():
         if "key_path" in item and "key" not in item:
             item["key"] = item.pop("key_path")
         targets.append(item)
-    return targets, None
+
+    opts = {}
+    if cfg.get("wecom"):
+        opts["wecom"] = normalize_wecom(cfg["wecom"])
+        opts["wecom_source"] = path
+    return targets, opts, None
+
+
+def resolve_wecom_key(opts):
+    """Config value wins; the standalone environment variable is the fallback."""
+    key = (opts.get("wecom") or "").strip()
+    if key:
+        return key, opts.get("wecom_source") or "config"
+    key = os.environ.get("WECOM_WEBHOOK_KEY", "").strip()
+    if key:
+        return normalize_wecom(key), "WECOM_WEBHOOK_KEY"
+    return "", ""
 
 
 def prepare_known_hosts(target):
@@ -213,7 +271,7 @@ def main():
         os.environ["DRY_RUN"] = "1"
     dry = os.environ.get("DRY_RUN", "").strip().lower() in ("1", "true", "yes")
 
-    targets, err = load_targets()
+    targets, opts, err = load_targets()
     if err:
         log(err)
         return 2
@@ -265,13 +323,17 @@ def main():
 
     content = "\n".join(lines)
 
+    key, source = resolve_wecom_key(opts)
     if dry:
+        if key:
+            log("[DRY_RUN] wecom key set (%d chars, from %s)" % (len(key), source))
+        else:
+            log("[DRY_RUN] wecom key not set, push would be skipped")
         log("DRY_RUN, nothing pushed")
         return 1 if failures else 0
 
-    key = os.environ.get("WECOM_WEBHOOK_KEY", "").strip()
     if not key:
-        log("[WECOM] WECOM_WEBHOOK_KEY not set, push skipped")
+        log("[WECOM] no webhook key configured, push skipped")
     else:
         try:
             sent, data = wecom_send(key, content)

@@ -11,7 +11,7 @@
 ```
 青龙容器 (manual task)
   └── tp_rotate.py
-        ├── 读 TINYPROXY_PWDEDITOR → 目标列表 / 私钥路径 / 主机公钥
+        ├── 读 TINYPROXY_PWDEDITOR → 目标列表 / 私钥路径 / 主机公钥 / 企微 key
         ├── 生成 8 位密码，只留在内存里
         ├── ssh -T ────────────────►  路由器 /usr/sbin/tp-setpw
         │                              （forced command，只有这一条路）
@@ -177,18 +177,21 @@ ssh -T -i /ql/data/keys/tp-ROUTER \
 **不要手工把脚本拷进容器。** 手工副本和仓库会分叉，下次拉取是覆盖
 还是并存取决于青龙版本，迟早会跑到一份过期代码上。
 
-### 4. 配置：两个环境变量
+### 4. 配置：一个环境变量
 
-青龙面板 → 环境变量 → 新增两条。全部参数都塞进 `TINYPROXY_PWDEDITOR`
-这一条里，不用再放配置文件。
+青龙面板 → 环境变量 → 只加 `TINYPROXY_PWDEDITOR` 这一条。路由器参数、
+私钥路径、主机公钥、企业微信 webhook key 全在里面，不用配置文件。
 
 #### TINYPROXY_PWDEDITOR（必填）
 
 一行写完全部参数：
 
 ```
-label=router-a,host=10.0.0.1,port=22,user=root,account=user,key=/ql/data/keys/tp-router-a,hostkey=ssh-ed25519:AAAAC3NzaC1lZDI1NTE5AAAA...
+wecom=693a91f6-xxxx-xxxx-xxxx-xxxxxxxxxxxx|label=router-a,host=10.0.0.1,port=22,user=root,account=user,key=/ql/data/keys/tp-router-a,hostkey=ssh-ed25519:AAAAC3NzaC1lZDI1NTE5AAAA...
 ```
+
+第一段 `wecom=...` 是**全局设置**，不属于任何一台路由器，所以单独用 `|`
+隔开放在最前面。放最后、或者直接塞进某个目标分片里也一样生效。
 
 | 字段 | 必填 | 默认 | 说明 |
 |---|---|---|---|
@@ -200,6 +203,7 @@ label=router-a,host=10.0.0.1,port=22,user=root,account=user,key=/ql/data/keys/tp
 | `account` | 否 | `user` | 要改密码的 tinyproxy 账号，**只能是 `user`**，helper 硬拒绝 `root` |
 | `hostkey` | 二选一 | — | 内联主机公钥，格式 `ssh-ed25519:AAAAC3...` |
 | `known_hosts` | 二选一 | — | 现成的 known_hosts 文件路径 |
+| `wecom` | 否 | — | 企业微信群机器人 key，**全局字段**，不属于某台路由器。不给就只轮换不推送 |
 
 **`hostkey` 怎么来（推荐，省掉一个文件）**
 
@@ -224,10 +228,10 @@ hostkey=内联公钥   >   known_hosts=文件路径   >   私钥同目录的 kno
 都不给就走第三个。文件不存在时 ssh 直接失败，不会退化到"信任所有"——
 这是故意的，宁可报错也不要静默降低安全性。
 
-**多台路由器**用 `|` 隔开：
+**多台路由器 + 全局企微 key** 用 `|` 隔开：
 
 ```
-label=a,host=10.0.0.1,key=/ql/data/keys/tp-a,hostkey=ssh-ed25519:AAAA...|label=b,host=10.0.0.2,port=2222,key=/ql/data/keys/tp-b,hostkey=ssh-ed25519:BBBB...
+wecom=693a91f6-xxxx-xxxx-xxxx-xxxxxxxxxxxx|label=a,host=10.0.0.1,key=/ql/data/keys/tp-a,hostkey=ssh-ed25519:AAAA...|label=b,host=10.0.0.2,port=2222,key=/ql/data/keys/tp-b,hostkey=ssh-ed25519:BBBB...
 ```
 
 **这条值的写法限制**（很重要，踩了会静默断掉）：
@@ -239,9 +243,38 @@ label=a,host=10.0.0.1,key=/ql/data/keys/tp-a,hostkey=ssh-ed25519:AAAA...|label=b
 
 密码本身不进这个变量，它只在运行时生成、经 SSH stdin 传给路由器。
 
-#### WECOM_WEBHOOK_KEY（可选）
+#### 全局字段 `wecom`
 
-企业微信群机器人 webhook 里 `.../send?key=` 后面那一串。没设就只轮换不推送。
+`wecom` 不属于任何一台路由器，是所有目标共用的一条推送通道。两种写法等价：
+
+```
+# 单独一个分片（推荐，读起来清楚）
+wecom=KEY|label=a,host=10.0.0.1,key=/k1
+
+# 塞在某个目标分片里（会被提出来，仍然作用于全体）
+label=a,host=10.0.0.1,key=/k1,wecom=KEY
+```
+
+只写 `wecom=` 而没有任何目标时，脚本报 `no target configured` 退出 2，
+不会静默地什么都不做。
+
+**值可以整段粘 URL**，脚本会自动截出 `key=` 后面那截：
+
+```
+wecom=https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=693a91f6-xxxx-...
+```
+
+企业微信后台的 key 形如 `693a91f6-7bcd-4f2a-9c31-0ec2sifa5aaa`，
+只含字母、数字和 `-`，不带空格逗号竖线，正好满足上面的写法限制。
+
+**优先级**：`TINYPROXY_PWDEDITOR` 里的 `wecom` > 环境变量
+`WECOM_WEBHOOK_KEY`。后者是给老部署留的兜底，两边都设时以配置里为准。
+`--dry-run` 会打印来源，便于确认到底读到了哪个。
+
+#### 老方式：单独设 WECOM_WEBHOOK_KEY（可选，已不推荐）
+
+如果不想把 key 和路由器参数放一起，仍然可以只设环境变量
+`WECOM_WEBHOOK_KEY`，脚本会拿它当兜底。没设就只轮换不推送。
 
 #### 验证配置对不对
 
@@ -251,12 +284,16 @@ label=a,host=10.0.0.1,key=/ql/data/keys/tp-a,hostkey=ssh-ed25519:AAAA...|label=b
 python3 /ql/data/scripts/<owner>_tp-rotate/tp_rotate.py --dry-run
 ```
 
-正常输出（`kh=inline hostkey` 说明走的是内联公钥）：
+正常输出（`kh=inline hostkey` 说明走的是内联公钥，第二行说明企微 key 读到了
+以及从哪读的）：
 
 ```
 [DRY_RUN] router-a -> root@10.0.0.1:22 account=user key=/ql/data/keys/tp-router-a kh=inline hostkey
+[DRY_RUN] wecom key set (36 chars, from TINYPROXY_PWDEDITOR)
 DRY_RUN, nothing pushed
 ```
+
+没配 key 时对应那行是 `wecom key not set, push would be skipped`。
 
 配置有问题的典型报错：
 
@@ -268,9 +305,11 @@ DRY_RUN, nothing pushed
 | `hostkey must be 'ssh-ed25519:AAAAC3...'` | 用了空格分隔，或者冒号后面是空的 |
 | `Permission denied (publickey)` | 公钥没写进路由器的 `authorized_keys`，或权限不是 600 |
 | `Host key verification failed` | `hostkey` 填的和路由器实际的不一致（换过固件/恢复过出厂） |
+| `no target configured` | 只写了 `wecom=` 之类的全局字段，没有任何带 `host`+`key` 的目标 |
 
 > 旧版本用 `/ql/data/config/tp-rotate.json` 存配置的方式仍然兼容，
-> 没设 `TINYPROXY_PWDEDITOR` 时会回退去读它。新装直接用环境变量就行。
+> 没设 `TINYPROXY_PWDEDITOR` 时会回退去读它；那个 JSON 里也支持顶层加
+> `"wecom": "..."`。新装直接用环境变量就行。
 
 ### 5. 建任务
 

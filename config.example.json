@@ -1,4 +1,5 @@
 {
+  "wecom": "PASTE_WECOM_WEBHOOK_KEY_OR_FULL_URL_HERE",
   "targets": [
     {
       "label": "router-a",
