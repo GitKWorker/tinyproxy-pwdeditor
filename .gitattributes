@@ -1,0 +1,2 @@
+# The router helper is a shell script: a CRLF checkout would break it.
+* text=auto eol=lf

@@ -1,0 +1,13 @@
+{
+  "targets": [
+    {
+      "label": "router-a",
+      "host": "10.0.0.1",
+      "port": 22,
+      "user": "root",
+      "account": "user",
+      "key_path": "/ql/data/keys/tp-router-a",
+      "known_hosts": "/ql/data/keys/known_hosts.tp-router-a"
+    }
+  ]
+}

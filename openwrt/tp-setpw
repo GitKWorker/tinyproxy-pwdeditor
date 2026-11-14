@@ -1,0 +1,174 @@
+#!/bin/sh
+# tp-setpw - rotate one tinyproxy BasicAuth password.
+#
+# Installed on the router as a forced command:
+#   command="/usr/sbin/tp-setpw",no-pty,no-port-forwarding,no-agent-forwarding,no-x11-forwarding
+#
+# Protocol
+#   stdin : one line, the new password
+#   stdout: "OK <account> <port>"      exit 0
+#           "ERR <reason>"             exit non-zero
+# The password is never echoed back and never written anywhere except the
+# uci config it belongs to.
+#
+# Guarantees enforced here:
+#   * an account other than $ALLOW_ACCOUNT cannot be targeted (root included)
+#   * the entry list is rebuilt in place, so every other entry keeps its
+#     exact byte content and its position (in particular "root ..." stays
+#     first, which the LuCI status page depends on)
+#   * password format is validated before anything is written
+#   * if anything fails after the write, the original list is restored and
+#     tinyproxy is restarted with it
+#   * a real HTTP probe runs against the local instance afterwards
+
+set -u
+
+CONFIG_NAME=tinyproxy
+ALLOW_ACCOUNT=user
+LOCKFILE=/var/lock/tp-setpw.lock
+STAGE=/tmp/tp-setpw.$$
+
+fail() {
+	printf 'ERR %s\n' "$1"
+	exit 1
+}
+
+cleanup() {
+	rm -f "$STAGE.bak" "$STAGE.hdr" "$STAGE.px"
+}
+
+trap cleanup EXIT
+
+# ---------------------------------------------------------------- locking ---
+exec 9>"$LOCKFILE" || fail lock-open
+flock -n 9 || fail busy
+
+# ------------------------------------------------------------ read stdin ---
+NEWPW=$(head -n 1 2>/dev/null)
+NEWPW=$(printf '%s' "$NEWPW" | tr -d '\r')
+[ -n "$NEWPW" ] || fail empty-password
+
+# ------------------------------------------------------------------ check ---
+[ ${#NEWPW} -eq 8 ] || fail bad-length
+case "$NEWPW" in
+	*[!A-Za-z0-9]*) fail bad-charset ;;
+esac
+case "$NEWPW" in
+	*[0O1lI]*) fail ambiguous-char ;;
+esac
+case "$NEWPW" in
+	*[A-Z]*) ;;
+	*) fail need-upper ;;
+esac
+case "$NEWPW" in
+	*[a-z]*) ;;
+	*) fail need-lower ;;
+esac
+case "$NEWPW" in
+	*[0-9]*) ;;
+	*) fail need-digit ;;
+esac
+
+# --------------------------------------------------------- locate section ---
+SECTIONS=$(uci -q show "$CONFIG_NAME" 2>/dev/null | sed -n "s/^${CONFIG_NAME}\.\([^.=]*\)=tinyproxy$/\1/p")
+SCOUNT=$(printf '%s\n' "$SECTIONS" | grep -c .)
+[ "$SCOUNT" -eq 1 ] || fail "section-count-$SCOUNT"
+SEC="$CONFIG_NAME.$SECTIONS"
+
+PORT=$(uci -q get "$SEC.Port") || fail no-port
+[ -n "$PORT" ] || fail no-port
+
+# ------------------------------------------------------- snapshot entries ---
+# uci does not support list indexing on anonymous sections, so take the whole
+# shell-quoted list and let the shell re-parse it.
+ENTRIES=$(uci -q get "$SEC.BasicAuth") || fail no-basicauth-entries
+[ -n "$ENTRIES" ] || fail no-basicauth-entries
+case "$ENTRIES" in
+	*'$'*|*'`'*|*'"'*) fail unsupported-char-in-entries ;;
+esac
+
+eval "set -- $ENTRIES"
+TOTAL=$#
+[ "$TOTAL" -gt 0 ] || fail no-basicauth-entries
+
+FOUND_ACCOUNT=0
+FOUND_ROOT=0
+: > "$STAGE.bak"
+for e in "$@"; do
+	printf '%s\n' "$e" >> "$STAGE.bak"
+	case "$e" in
+		"$ALLOW_ACCOUNT "*) FOUND_ACCOUNT=$((FOUND_ACCOUNT + 1)) ;;
+		"root "*) FOUND_ROOT=$((FOUND_ROOT + 1)) ;;
+	esac
+done
+
+[ "$FOUND_ACCOUNT" -eq 1 ] || fail "account-count-$FOUND_ACCOUNT"
+[ "$FOUND_ROOT" -eq 1 ] || fail "root-count-$FOUND_ROOT"
+ROOTREF=$(head -n 1 "$STAGE.bak")
+[ "$(printf '%s' "$ROOTREF" | cut -d' ' -f1)" = root ] || fail root-not-first
+
+# --------------------------------------------------------------- rollback ---
+restore() {
+	uci -q delete "$SEC.BasicAuth"
+	while IFS= read -r line; do
+		[ -n "$line" ] || continue
+		uci -q add_list "$SEC.BasicAuth=$line"
+	done < "$STAGE.bak"
+	uci -q commit "$CONFIG_NAME"
+	/etc/init.d/tinyproxy restart >/dev/null 2>&1
+}
+
+# ------------------------------------------------------------------ write ---
+uci -q delete "$SEC.BasicAuth" || { restore; fail uci-delete; }
+
+while IFS= read -r line; do
+	[ -n "$line" ] || continue
+	case "$line" in
+		"$ALLOW_ACCOUNT "*) line="$ALLOW_ACCOUNT $NEWPW" ;;
+	esac
+	uci -q add_list "$SEC.BasicAuth=$line" || { restore; fail uci-add; }
+done < "$STAGE.bak"
+
+eval "set -- $(uci -q get "$SEC.BasicAuth")"
+[ $# -eq "$TOTAL" ] || { restore; fail entry-count-changed; }
+[ "$1" = "$ROOTREF" ] || { restore; fail root-entry-mutated; }
+
+uci -q commit "$CONFIG_NAME" || { restore; fail uci-commit; }
+
+/etc/init.d/tinyproxy restart >/dev/null 2>&1
+
+# ------------------------------------------------------------- self test ---
+n=0
+while [ $n -lt 25 ]; do
+	CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 "http://127.0.0.1:$PORT/" 2>/dev/null)
+	[ -n "$CODE" ] && [ "$CODE" != 000 ] && break
+	n=$((n + 1))
+	sleep 1
+done
+
+probe_auth() {
+	printf 'header = "Authorization: Basic %s"\n' "$(printf '%s' "$1" | openssl base64 -A)" > "$STAGE.hdr"
+	curl -s -o /dev/null -w '%{http_code}' --max-time 6 -K "$STAGE.hdr" "http://127.0.0.1:$PORT/"
+}
+
+CODE_NONE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 6 "http://127.0.0.1:$PORT/")
+CODE_BAD=$(probe_auth "$ALLOW_ACCOUNT:zzzzzzzz")
+CODE_NEW=$(probe_auth "$ALLOW_ACCOUNT:$NEWPW")
+
+# tinyproxy answers 401 (not 407) when the request is aimed straight at the
+# listener; 407 only appears in proxy mode. 200 means the password was taken.
+[ "$CODE_NONE" = 401 ] || { restore; fail "probe-anonymous-$CODE_NONE"; }
+[ "$CODE_BAD" = 401 ] || { restore; fail "probe-wrongpw-$CODE_BAD"; }
+[ "$CODE_NEW" = 200 ] || { restore; fail "probe-newpw-$CODE_NEW"; }
+
+# And once through real proxy mode, which is how clients actually use it.
+printf 'proxy-user = "%s"\n' "$ALLOW_ACCOUNT:$NEWPW" > "$STAGE.px"
+CODE_PX=$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 \
+	-x "http://127.0.0.1:$PORT" -K "$STAGE.px" "http://127.0.0.1:$PORT/" 2>/dev/null)
+[ "$CODE_PX" = 200 ] || { restore; fail "probe-proxy-$CODE_PX"; }
+
+eval "set -- $(uci -q get "$SEC.BasicAuth")"
+[ "$1" = "$ROOTREF" ] || { restore; fail root-entry-mutated-after-probe; }
+
+printf 'OK %s %s\n' "$ALLOW_ACCOUNT" "$PORT"
+exit 0

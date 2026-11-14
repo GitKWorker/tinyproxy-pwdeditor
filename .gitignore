@@ -1,0 +1,14 @@
+# local runtime config: contains internal addresses, never commit
+tp-rotate.json
+config.json
+
+# keys and pins
+*.pem
+*.key
+id_ed25519*
+known_hosts*
+!known_hosts.example
+
+# python
+__pycache__/
+*.pyc
