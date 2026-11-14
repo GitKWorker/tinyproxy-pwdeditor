@@ -165,14 +165,18 @@ ssh -T -i /ql/data/keys/tp-ROUTER \
 | 字段 | 值 |
 |---|---|
 | 名称 | `tp-rotate` |
-| 链接 | `https://github.com/USER/tp-rotate.git` |
+| 链接 | `https://github.com/GitKWorker/tinyproxy-pwdeditor.git` |
 | 分支 | `main` |
 | 白名单 | 留空 |
 | 黑名单 | 留空 |
 | 依赖文件 | 留空 |
 | 定时规则 | 留空（只手动拉取，不自动同步） |
 
-保存后点「运行」，代码落到 `/ql/data/scripts/<owner>_tp-rotate/`。
+保存后点「运行」，代码落到 `/ql/data/scripts/GitKWorker_tinyproxy-pwdeditor_main/`。
+
+注意目录名末尾那个 `_main` 是**分支名后缀**：青龙在订阅里指定了分支时，
+落地目录会拼成 `<owner>_<repo>_<branch>`。不是 `-main`，也不省略，填路径时
+容易少一段。拉完 `ls /ql/data/scripts/ | grep tinyproxy` 对一下再继续。
 
 **不要手工把脚本拷进容器。** 手工副本和仓库会分叉，下次拉取是覆盖
 还是并存取决于青龙版本，迟早会跑到一份过期代码上。
@@ -281,7 +285,7 @@ wecom=https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=693a91f6-xxxx-...
 建任务之前先空跑一次，配置错误会在这时候暴露，不会真的改密码：
 
 ```sh
-python3 /ql/data/scripts/<owner>_tp-rotate/tp_rotate.py --dry-run
+python3 /ql/data/scripts/GitKWorker_tinyproxy-pwdeditor_main/tp_rotate.py --dry-run
 ```
 
 正常输出（`kh=inline hostkey` 说明走的是内联公钥，第二行说明企微 key 读到了
@@ -318,11 +322,14 @@ DRY_RUN, nothing pushed
 | 项 | 值 |
 |---|---|
 | 名称 | tinyproxy 密码轮换 |
-| 命令 | `python3 /ql/data/scripts/<owner>_tp-rotate/tp_rotate.py` |
+| 命令 | `python3 /ql/data/scripts/GitKWorker_tinyproxy-pwdeditor_main/tp_rotate.py` |
 | 定时规则 | 留空（只手动触发，不要填 cron） |
 
-`<owner>` 是拉取后实际生成的目录前缀，`ls /ql/data/scripts/ | grep tp-rotate`
-确认一下再填。
+从订阅拉取时青龙会自动建一条任务，名字和命令都已经对上，一般不用重建；
+但**自动建的定时规则会带上一个默认 cron**（形如 `30 20 10 * * *`），
+必须手动清空，否则它每天自己跑一次、每天换一个密码。
+
+命令里的目录名以实际落地的为准，`ls /ql/data/scripts/ | grep tinyproxy` 确认。
 
 保存后点「运行」即可。要空跑看效果，命令后面加 `--dry-run`。
 
