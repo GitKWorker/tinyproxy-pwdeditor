@@ -11,6 +11,7 @@
 ```
 青龙容器 (manual task)
   └── tp_rotate.py
+        ├── 读 TINYPROXY_PWDEDITOR → 目标列表 / 私钥路径 / 主机公钥
         ├── 生成 8 位密码，只留在内存里
         ├── ssh -T ────────────────►  路由器 /usr/sbin/tp-setpw
         │                              （forced command，只有这一条路）
@@ -176,50 +177,102 @@ ssh -T -i /ql/data/keys/tp-ROUTER \
 **不要手工把脚本拷进容器。** 手工副本和仓库会分叉，下次拉取是覆盖
 还是并存取决于青龙版本，迟早会跑到一份过期代码上。
 
-### 4. 青龙端：写配置
+### 4. 配置：两个环境变量
 
-密钥在第 1 步已经生成好了，这一步只放配置。复制 `config.example.json`
-到 `/ql/data/config/tp-rotate.json` 并按实际环境填写：
+青龙面板 → 环境变量 → 新增两条。全部参数都塞进 `TINYPROXY_PWDEDITOR`
+这一条里，不用再放配置文件。
 
-```json
-{
-  "targets": [
-    {
-      "label": "router-a",
-      "host": "10.0.0.1",
-      "port": 22,
-      "user": "root",
-      "account": "user",
-      "key_path": "/ql/data/keys/tp-router-a",
-      "known_hosts": "/ql/data/keys/known_hosts.tp-router-a"
-    }
-  ]
-}
+#### TINYPROXY_PWDEDITOR（必填）
+
+一行写完全部参数：
+
+```
+label=router-a,host=10.0.0.1,port=22,user=root,account=user,key=/ql/data/keys/tp-router-a,hostkey=ssh-ed25519:AAAAC3NzaC1lZDI1NTE5AAAA...
 ```
 
-| 字段 | 含义 |
+| 字段 | 必填 | 默认 | 说明 |
+|---|---|---|---|
+| `host` | **是** | — | 路由器地址 |
+| `key` | **是** | — | 私钥路径。私钥**只能**是文件，不能内联 |
+| `label` | 否 | 取 `host` | 显示名。不给 `hostkey`/`known_hosts` 时也用它拼文件名 |
+| `port` | 否 | `22` | SSH 端口 |
+| `user` | 否 | `root` | SSH 登录用户 |
+| `account` | 否 | `user` | 要改密码的 tinyproxy 账号，**只能是 `user`**，helper 硬拒绝 `root` |
+| `hostkey` | 二选一 | — | 内联主机公钥，格式 `ssh-ed25519:AAAAC3...` |
+| `known_hosts` | 二选一 | — | 现成的 known_hosts 文件路径 |
+
+**`hostkey` 怎么来（推荐，省掉一个文件）**
+
+在青龙容器里跑：
+
+```sh
+ssh-keyscan -t ed25519 10.0.0.1 2>/dev/null | awk '/ssh-ed25519/{print "ssh-ed25519:"$3; exit}'
+```
+
+输出就是 `ssh-ed25519:AAAAC3...`，整串粘到 `hostkey=` 后面。
+
+那个**冒号不是笔误**。标准 known_hosts 一行是三列 `host keytype base64`，
+这里 `host` 已经单独给了，只剩后两列；用空格连接会在这条环境变量里断词，
+所以改用冒号。脚本收到后会重新拼成合法的一行写进临时文件，用完立刻删掉。
+
+**三种主机公钥校验方式的优先级**：
+
+```
+hostkey=内联公钥   >   known_hosts=文件路径   >   私钥同目录的 known_hosts.<label>
+```
+
+都不给就走第三个。文件不存在时 ssh 直接失败，不会退化到"信任所有"——
+这是故意的，宁可报错也不要静默降低安全性。
+
+**多台路由器**用 `|` 隔开：
+
+```
+label=a,host=10.0.0.1,key=/ql/data/keys/tp-a,hostkey=ssh-ed25519:AAAA...|label=b,host=10.0.0.2,port=2222,key=/ql/data/keys/tp-b,hostkey=ssh-ed25519:BBBB...
+```
+
+**这条值的写法限制**（很重要，踩了会静默断掉）：
+
+- 不要有空格。`key = /a` 这种带空格的写法不行
+- 不要有单引号、双引号
+- 不要有 `$` 和反引号
+- 字段之间用 `,`，字段内部 `=` 只用于分隔键和值
+
+密码本身不进这个变量，它只在运行时生成、经 SSH stdin 传给路由器。
+
+#### WECOM_WEBHOOK_KEY（可选）
+
+企业微信群机器人 webhook 里 `.../send?key=` 后面那一串。没设就只轮换不推送。
+
+#### 验证配置对不对
+
+建任务之前先空跑一次，配置错误会在这时候暴露，不会真的改密码：
+
+```sh
+python3 /ql/data/scripts/<owner>_tp-rotate/tp_rotate.py --dry-run
+```
+
+正常输出（`kh=inline hostkey` 说明走的是内联公钥）：
+
+```
+[DRY_RUN] router-a -> root@10.0.0.1:22 account=user key=/ql/data/keys/tp-router-a kh=inline hostkey
+DRY_RUN, nothing pushed
+```
+
+配置有问题的典型报错：
+
+| 输出 | 原因 |
 |---|---|
-| `label` | 显示名字，也用于默认推导 known_hosts 文件名 |
-| `host` / `port` | 路由器地址和 SSH 端口 |
-| `user` | SSH 登录名，通常 `root` |
-| `account` | 要改密码的 tinyproxy 账号，**只能是 `user`**，helper 会硬拒绝 `root` |
-| `key_path` | 私钥路径 |
-| `known_hosts` | 可选，缺省为私钥同目录下 `known_hosts.<label>` |
+| `malformed: missing required field: host` | 没写 `host` |
+| `malformed: missing required field: key` | 没写私钥路径 |
+| `malformed: unknown field 'xxx'` | 字段名拼错，会列出所有可用字段 |
+| `hostkey must be 'ssh-ed25519:AAAAC3...'` | 用了空格分隔，或者冒号后面是空的 |
+| `Permission denied (publickey)` | 公钥没写进路由器的 `authorized_keys`，或权限不是 600 |
+| `Host key verification failed` | `hostkey` 填的和路由器实际的不一致（换过固件/恢复过出厂） |
 
-`tp-rotate.json` 里有内网地址，**不要提交到任何仓库**，权限设 `600`。
-配置路径可以用环境变量 `TP_CONFIG` 覆盖，方便一份代码挂多个环境。
+> 旧版本用 `/ql/data/config/tp-rotate.json` 存配置的方式仍然兼容，
+> 没设 `TINYPROXY_PWDEDITOR` 时会回退去读它。新装直接用环境变量就行。
 
-### 5. 环境变量
-
-在青龙「环境变量」里加：
-
-| 名称 | 说明 |
-|---|---|
-| `WECOM_WEBHOOK_KEY` | 企业微信群机器人的 key（`.../send?key=` 后面那串） |
-
-没设这个变量时脚本照常轮换，只是不推送。
-
-### 6. 建任务
+### 5. 建任务
 
 青龙面板 → 定时任务 → 新建：
 
@@ -233,6 +286,7 @@ ssh -T -i /ql/data/keys/tp-ROUTER \
 确认一下再填。
 
 保存后点「运行」即可。要空跑看效果，命令后面加 `--dry-run`。
+
 
 
 ## 输出
